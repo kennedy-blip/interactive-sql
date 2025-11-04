@@ -3,3 +3,4 @@ understood
 clean
 github
 ollama
+sql
