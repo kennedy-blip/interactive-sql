@@ -2,3 +2,4 @@ starndard
 understood
 clean
 github
+ollama
