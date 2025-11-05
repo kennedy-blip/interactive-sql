@@ -6,3 +6,4 @@ ollama
 sql
 control
 wait
+on
