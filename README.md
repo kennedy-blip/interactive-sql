@@ -5,3 +5,4 @@ github
 ollama
 sql
 control
+wait
