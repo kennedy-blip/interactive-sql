@@ -10,3 +10,4 @@ on
 rip
 explain
 work
+all
