@@ -7,8 +7,12 @@ import {
 } from "react";
 import {
   Activity,
+  AlertTriangle,
+  ArrowDown,
   ArrowDownUp,
   ArrowRight,
+  ArrowUp,
+  ArrowUpDown,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -16,31 +20,45 @@ import {
   CircleAlert,
   Clock3,
   Code2,
+  Command,
   Copy,
+  CornerDownLeft,
+  CornerUpLeft,
   Database,
   Download,
   FileCode2,
   FileJson2,
   Filter,
   GitMerge,
+  History,
   Info,
   Layers3,
+  Link2,
   LoaderCircle,
   Play,
   Plus,
   RotateCcw,
   Search,
+  ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Table2,
   Terminal,
+  Timer,
   Trash2,
   WandSparkles,
   X,
   Zap,
+  type LucideIcon,
 } from "lucide-react";
 import { format } from "sql-formatter";
+import {
+  SEVERITY_LABEL,
+  lintCounts,
+  lintSql,
+  type LintSeverity,
+} from "@/lib/lint";
 
 const DIALECTS = ["PostgreSQL", "MySQL", "SQLite", "Snowflake"] as const;
 type Dialect = (typeof DIALECTS)[number];
@@ -141,6 +159,31 @@ type Execution = {
 };
 
 type SelectOption = { value: string; label: string };
+
+type HistoryEntry = {
+  id: string;
+  sql: string;
+  dialect: Dialect;
+  builder: BuilderState;
+  latency: number;
+  rows: number;
+  score: number;
+  ranAt: number;
+  summary: string;
+  source: "builder" | "manual";
+};
+
+type PaletteAction = {
+  id: string;
+  label: string;
+  group: string;
+  hint?: string;
+  icon: LucideIcon;
+  run: () => void;
+};
+
+const HISTORY_KEY = "querypulse-history-v1";
+const HISTORY_LIMIT = 12;
 
 function relationFor(base: TableName, target: TableName): [string, string] {
   return (
@@ -849,16 +892,166 @@ function readDraft(): {
   }
 }
 
+function readHistory(): HistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((entry): entry is HistoryEntry => {
+        if (!entry || typeof entry !== "object") return false;
+        const candidate = entry as Partial<HistoryEntry>;
+        return (
+          typeof candidate.sql === "string" &&
+          typeof candidate.latency === "number" &&
+          typeof candidate.ranAt === "number" &&
+          typeof candidate.score === "number" &&
+          typeof candidate.rows === "number" &&
+          DIALECTS.includes(candidate.dialect as Dialect) &&
+          isBuilderState(candidate.builder)
+        );
+      })
+      .slice(0, HISTORY_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function isBuilderState(value: unknown): value is BuilderState {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<BuilderState>;
+  return (
+    TABLE_NAMES.includes(candidate.baseTable as TableName) &&
+    Array.isArray(candidate.selectedColumns) &&
+    Array.isArray(candidate.filters) &&
+    typeof candidate.limit === "number"
+  );
+}
+
+function summarizeSql(sql: string, builder: BuilderState): string {
+  const base = sql.match(/\bFROM\s+([a-z_]\w*)/i)?.[1] ?? builder.baseTable;
+  const joined = sql.match(/\bJOIN\s+([a-z_]\w*)/i)?.[1];
+  return joined ? `${base} ⨝ ${joined}` : base;
+}
+
+function formatRunTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const isToday = date.toDateString() === new Date().toDateString();
+  return isToday
+    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function latencyTone(latency: number): "fast" | "steady" | "slow" {
+  return latency < 145 ? "fast" : latency < 190 ? "steady" : "slow";
+}
+
+function compareCells(
+  left: string | number,
+  right: string | number,
+): number {
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  return String(left).localeCompare(String(right), undefined, {
+    numeric: true,
+  });
+}
+
+function csvCell(value: unknown): string {
+  const text = String(value ?? "");
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function downloadFile(filename: string, contents: string, mime: string) {
+  const url = URL.createObjectURL(new Blob([contents], { type: mime }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+type ShareableWorkspace = {
+  builder: BuilderState;
+  dialect: Dialect;
+  manualSql: string | null;
+};
+
+function encodeWorkspace(state: ShareableWorkspace): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(state));
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function decodeWorkspace(value: string): ShareableWorkspace | null {
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(
+      Math.ceil(normalized.length / 4) * 4,
+      "=",
+    );
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (!parsed || typeof parsed !== "object") return null;
+    const candidate = parsed as {
+      builder?: unknown;
+      dialect?: unknown;
+      manualSql?: unknown;
+    };
+    if (!isBuilderState(candidate.builder)) return null;
+    return {
+      builder: candidate.builder,
+      dialect: DIALECTS.includes(candidate.dialect as Dialect)
+        ? (candidate.dialect as Dialect)
+        : "PostgreSQL",
+      manualSql:
+        typeof candidate.manualSql === "string" ? candidate.manualSql : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readSharedWorkspace(): ShareableWorkspace | null {
+  if (typeof window === "undefined") return null;
+  const marker = "#q=";
+  if (!window.location.hash.startsWith(marker)) return null;
+  return decodeWorkspace(window.location.hash.slice(marker.length));
+}
+
+function readInitialWorkspace() {
+  const shared = readSharedWorkspace();
+  const draft = readDraft();
+  return {
+    builder: shared?.builder ?? draft?.builder ?? newBuilderFor("users"),
+    dialect: shared?.dialect ?? draft?.dialect ?? "PostgreSQL",
+    manualSql: shared ? shared.manualSql : (draft?.manualSql ?? null),
+    fromShare: shared !== null,
+  };
+}
+
+const INITIAL_WORKSPACE = readInitialWorkspace();
+
 export default function App() {
-  const [builder, setBuilder] = useState<BuilderState>(
-    () => readDraft()?.builder ?? newBuilderFor("users"),
-  );
-  const [dialect, setDialect] = useState<Dialect>(
-    () => readDraft()?.dialect ?? "PostgreSQL",
-  );
+  const [builder, setBuilder] = useState<BuilderState>(INITIAL_WORKSPACE.builder);
+  const [dialect, setDialect] = useState<Dialect>(INITIAL_WORKSPACE.dialect);
   const [manualSql, setManualSql] = useState<string | null>(
-    () => readDraft()?.manualSql ?? null,
+    INITIAL_WORKSPACE.manualSql,
   );
+  const [history, setHistory] = useState<HistoryEntry[]>(() => readHistory());
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [paletteIndex, setPaletteIndex] = useState(0);
+  const [sort, setSort] = useState<{
+    column: string;
+    direction: "asc" | "desc";
+  } | null>(null);
   const compiledSql = useMemo(() => buildSql(builder), [builder]);
   const sql = manualSql ?? compiledSql;
   const [execution, setExecution] = useState<Execution>(() =>
@@ -883,6 +1076,8 @@ export default function App() {
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLPreElement>(null);
   const gutterRef = useRef<HTMLDivElement>(null);
+  const paletteInputRef = useRef<HTMLInputElement>(null);
+  const shareNoticeRef = useRef(INITIAL_WORKSPACE.fromShare);
 
   const baseAlias = TABLES[builder.baseTable].alias;
   const joinAlias = TABLES[builder.joinTable].alias;
@@ -954,6 +1149,19 @@ export default function App() {
         ]),
       ),
     );
+  const sortedRows =
+    sort && execution.columns.includes(sort.column)
+      ? [...resultRows].sort(
+          (left, right) =>
+            compareCells(left[sort.column], right[sort.column]) *
+            (sort.direction === "asc" ? 1 : -1),
+        )
+      : resultRows;
+  const findings = useMemo(() => lintSql(sql), [sql]);
+  const lintSummary = useMemo(() => lintCounts(findings), [findings]);
+  const lintTotal =
+    lintSummary.critical + lintSummary.warning + lintSummary.info;
+  const maxLatency = Math.max(120, ...history.map((entry) => entry.latency));
 
   useEffect(() => {
     try {
@@ -965,6 +1173,55 @@ export default function App() {
       /* The workspace still works if local storage is unavailable. */
     }
   }, [builder, dialect, manualSql]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch {
+      /* History stays session-only when storage is blocked. */
+    }
+  }, [history]);
+
+  useEffect(() => {
+    if (!shareNoticeRef.current) return;
+    shareNoticeRef.current = false;
+    notify("Loaded the shared workspace from this link.");
+  }, []);
+
+  useEffect(() => {
+    if (!paletteOpen) return;
+    const oldOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const frame = requestAnimationFrame(() => paletteInputRef.current?.focus());
+    return () => {
+      document.body.style.overflow = oldOverflow;
+      cancelAnimationFrame(frame);
+    };
+  }, [paletteOpen]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPaletteOpen(false);
+        return;
+      }
+      if (!(event.metaKey || event.ctrlKey)) return;
+      const key = event.key.toLowerCase();
+      if (key === "k") {
+        event.preventDefault();
+        setPaletteOpen((open) => !open);
+        setPaletteQuery("");
+        setPaletteIndex(0);
+        return;
+      }
+      if (key === "f" && event.shiftKey) {
+        event.preventDefault();
+        formatSql();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [sql, dialect]);
 
   useEffect(() => {
     if (!drawerOpen) return;
@@ -1123,23 +1380,171 @@ export default function App() {
     }
   }
 
-  function runQuery() {
-    if (running) return;
-    if (!/\b(SELECT|WITH)\b/i.test(sql)) {
+  function simulate(
+    nextSql: string,
+    nextDialect: Dialect,
+    nextBuilder: BuilderState,
+    nextManual: boolean,
+    options: { quiet?: boolean } = {},
+  ) {
+    if (running) {
+      notify("A simulation is already running.", true);
+      return;
+    }
+    if (!/\b(SELECT|WITH)\b/i.test(nextSql)) {
       notify("Add a SELECT query before running the simulation.", true);
       return;
     }
     setRunning(true);
     runTimer.current = setTimeout(() => {
       const latency = 118 + Math.floor(Math.random() * 68);
-      setExecution(
-        makeExecution(sql, dialect, builder, latency, manualSql !== null),
+      const nextExecution = makeExecution(
+        nextSql,
+        nextDialect,
+        nextBuilder,
+        latency,
+        nextManual,
       );
+      const summary = summarizeSql(nextSql, nextBuilder);
+      setExecution(nextExecution);
       setRunning(false);
+      setSort(null);
       setResultView("table");
       setScriptVisible(false);
-      notify("Query simulation completed successfully.");
+      setHistory((previous) =>
+        [
+          {
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            sql: nextSql,
+            dialect: nextDialect,
+            builder: {
+              ...nextBuilder,
+              selectedColumns: [...nextBuilder.selectedColumns],
+              filters: nextBuilder.filters.map((filter) => ({ ...filter })),
+            },
+            latency,
+            rows: nextExecution.rows,
+            score: nextExecution.score,
+            ranAt: Date.now(),
+            summary,
+            source: nextManual ? "manual" : "builder",
+          } satisfies HistoryEntry,
+          ...previous,
+        ].slice(0, HISTORY_LIMIT),
+      );
+      notify(
+        options.quiet
+          ? `Re-ran ${summary} in ${latency}ms.`
+          : "Query simulation completed successfully.",
+      );
     }, 820);
+  }
+
+  function runQuery() {
+    simulate(sql, dialect, builder, manualSql !== null);
+  }
+
+  function loadHistoryEntry(entry: HistoryEntry) {
+    setBuilder({
+      ...entry.builder,
+      selectedColumns: [...entry.builder.selectedColumns],
+      filters: entry.builder.filters.map((filter) => ({ ...filter })),
+    });
+    setDialect(entry.dialect);
+    setManualSql(entry.source === "manual" ? entry.sql : null);
+    setSort(null);
+    notify(`Loaded ${entry.summary} from ${formatRunTime(entry.ranAt)}.`);
+  }
+
+  function rerunHistoryEntry(entry: HistoryEntry) {
+    loadHistoryEntry(entry);
+    simulate(entry.sql, entry.dialect, entry.builder, entry.source === "manual", {
+      quiet: true,
+    });
+  }
+
+  function clearHistory() {
+    setHistory([]);
+    notify("Run history cleared from this browser.");
+  }
+
+  function toggleSort(column: string) {
+    setSort((previous) =>
+      previous?.column === column
+        ? {
+            column,
+            direction: previous.direction === "asc" ? "desc" : "asc",
+          }
+        : { column, direction: "asc" },
+    );
+  }
+
+  function exportCsv() {
+    const header = execution.columns.map(csvCell).join(",");
+    const lines = sortedRows.map((row) =>
+      execution.columns.map((column) => csvCell(row[column])).join(","),
+    );
+    downloadFile(
+      `querypulse-results-${new Date().toISOString().slice(0, 10)}.csv`,
+      [header, ...lines].join("\n"),
+      "text/csv;charset=utf-8",
+    );
+    notify(`Exported ${sortedRows.length} simulated rows as CSV.`);
+  }
+
+  function copyShareLink() {
+    const encoded = encodeWorkspace({ builder, dialect, manualSql });
+    void copyText(
+      `${window.location.origin}${window.location.pathname}#q=${encoded}`,
+      "Share link copied — it restores this exact workspace.",
+    );
+  }
+
+  function closePalette() {
+    setPaletteOpen(false);
+    setPaletteQuery("");
+    setPaletteIndex(0);
+  }
+
+  function openPalette() {
+    setPaletteQuery("");
+    setPaletteIndex(0);
+    setPaletteOpen(true);
+  }
+
+  function runPaletteAction(action: PaletteAction) {
+    closePalette();
+    action.run();
+  }
+
+  function handlePaletteKeyDown(
+    event: ReactKeyboardEvent<HTMLInputElement>,
+  ) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closePalette();
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setPaletteIndex(
+        (index) => (index + 1) % Math.max(1, paletteResults.length),
+      );
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setPaletteIndex(
+        (index) =>
+          (index - 1 + paletteResults.length) % Math.max(1, paletteResults.length),
+      );
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const action = paletteResults[activePaletteIndex];
+      if (action) runPaletteAction(action);
+    }
   }
 
   async function copyText(text: string, successMessage: string) {
@@ -1188,18 +1593,31 @@ export default function App() {
           `- ${item.status === "passed" ? "[x]" : "[ ]"} ${item.title}: ${item.description}`,
       ),
       "",
+      `## Static Analysis (${lintTotal} findings)`,
+      ...(findings.length
+        ? findings.map(
+            (finding) =>
+              `- [${SEVERITY_LABEL[finding.severity]}] line ${finding.line} · ${finding.title} — ${finding.hint}`,
+          )
+        : ["- No anti-patterns detected."]),
+      "",
+      `## Recent Runs (${history.length})`,
+      ...(history.length
+        ? history
+            .slice(0, 5)
+            .map(
+              (entry) =>
+                `- ${formatRunTime(entry.ranAt)} · ${entry.summary} · ${entry.latency}ms · score ${entry.score}`,
+            )
+        : ["- No runs recorded yet."]),
+      "",
       "Note: Execution, costs, rows, and recommendations are simulated. No database connection is required.",
     ].join("\n");
-    const url = URL.createObjectURL(
-      new Blob([report], { type: "text/markdown;charset=utf-8" }),
+    downloadFile(
+      `querypulse-report-${new Date().toISOString().slice(0, 10)}.md`,
+      report,
+      "text/markdown;charset=utf-8",
     );
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `querypulse-report-${new Date().toISOString().slice(0, 10)}.md`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
     notify("Query report downloaded.");
   }
 
@@ -1230,6 +1648,132 @@ export default function App() {
     if (gutterRef.current)
       gutterRef.current.scrollTop = editorRef.current.scrollTop;
   }
+
+  const jumpTo = (id: string) =>
+    document
+      .getElementById(id)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  const paletteActions: PaletteAction[] = [
+    {
+      id: "run",
+      label: "Run query simulation",
+      group: "Workspace",
+      hint: "⌘ ↵",
+      icon: Play,
+      run: runQuery,
+    },
+    {
+      id: "format",
+      label: "Format SQL",
+      group: "Workspace",
+      hint: "⌘ ⇧ F",
+      icon: WandSparkles,
+      run: formatSql,
+    },
+    {
+      id: "copy-sql",
+      label: "Copy SQL to clipboard",
+      group: "Workspace",
+      icon: Copy,
+      run: () => void copyText(sql, "SQL copied to clipboard."),
+    },
+    {
+      id: "share",
+      label: "Copy share link for this workspace",
+      group: "Workspace",
+      icon: Link2,
+      run: copyShareLink,
+    },
+    {
+      id: "report",
+      label: "Export Markdown report",
+      group: "Export",
+      icon: Download,
+      run: exportReport,
+    },
+    {
+      id: "csv",
+      label: "Export results as CSV",
+      group: "Export",
+      icon: Table2,
+      run: exportCsv,
+    },
+    {
+      id: "recommendations",
+      label: "Open optimizer recommendations",
+      group: "Insights",
+      icon: Sparkles,
+      run: () => {
+        setDrawerOpen(true);
+        setScriptVisible(false);
+      },
+    },
+    {
+      id: "intel",
+      label: "Jump to query intelligence",
+      group: "Insights",
+      icon: ShieldAlert,
+      run: () => jumpTo("intel-title"),
+    },
+    {
+      id: "history",
+      label: "Jump to run history",
+      group: "Insights",
+      icon: History,
+      run: () => jumpTo("history-title"),
+    },
+    {
+      id: "clear-history",
+      label: "Clear run history",
+      group: "Insights",
+      icon: Trash2,
+      run: clearHistory,
+    },
+    {
+      id: "reset",
+      label: "Reset workspace to starter query",
+      group: "Workspace",
+      icon: RotateCcw,
+      run: () => {
+        setBuilder(newBuilderFor("users"));
+        setManualSql(null);
+        setSort(null);
+        notify("Workspace reset to the starter query.");
+      },
+    },
+    ...TABLE_NAMES.map<PaletteAction>((table) => ({
+      id: `table-${table}`,
+      label: `Use ${table} as the base table`,
+      group: "Schema",
+      icon: Database,
+      run: () => {
+        chooseTable(table);
+        notify(`Base table set to ${table}.`);
+      },
+    })),
+    ...DIALECTS.map<PaletteAction>((item) => ({
+      id: `dialect-${item}`,
+      label: `Switch dialect to ${item}`,
+      group: "Dialect",
+      icon: Terminal,
+      run: () => {
+        setDialect(item);
+        notify(`Dialect set to ${item}.`);
+      },
+    })),
+  ];
+  const normalizedPaletteQuery = paletteQuery.trim().toLowerCase();
+  const paletteResults = normalizedPaletteQuery
+    ? paletteActions.filter((action) =>
+        `${action.label} ${action.group}`
+          .toLowerCase()
+          .includes(normalizedPaletteQuery),
+      )
+    : paletteActions;
+  const activePaletteIndex = paletteResults.length
+    ? Math.min(paletteIndex, paletteResults.length - 1)
+    : 0;
 
   const scoreTitle =
     execution.score >= 85
@@ -1273,6 +1817,19 @@ export default function App() {
             ))}
           </nav>
           <div className="header-actions">
+            <button
+              type="button"
+              className="search-trigger"
+              onClick={openPalette}
+              title="Command palette (Ctrl or ⌘ + K)"
+              aria-label="Open command palette"
+            >
+              <Search size={14} />
+              <span>Search</span>
+              <kbd>
+                <Command size={10} />K
+              </kbd>
+            </button>
             <div
               className="connection-status"
               title="Connected to the local query simulator; no live database is used"
@@ -1291,6 +1848,15 @@ export default function App() {
             >
               <WandSparkles size={16} />
               <span>Format SQL</span>
+            </button>
+            <button
+              type="button"
+              className="header-text-button"
+              onClick={copyShareLink}
+              title="Copy a link that restores this workspace"
+            >
+              <Link2 size={16} />
+              <span>Share</span>
             </button>
             <button
               type="button"
@@ -1888,6 +2454,206 @@ export default function App() {
           </div>
         </section>
 
+        <section className="analysis-section" aria-labelledby="intel-title">
+          <div className="section-heading">
+            <div>
+              <div className="content-eyebrow">
+                DEEPER SIGNALS <span />
+              </div>
+              <h2 id="intel-title">Query intelligence</h2>
+              <p>
+                Static analysis on every keystroke, plus a latency trend of your
+                recent runs.
+              </p>
+            </div>
+            <span
+              className={`analysis-state ${lintSummary.critical || lintSummary.warning ? "stale" : ""}`}
+            >
+              <span />
+              {lintTotal === 0
+                ? "No anti-patterns found"
+                : `${lintTotal} ${lintTotal === 1 ? "finding" : "findings"} to review`}
+            </span>
+          </div>
+          <div className="intel-grid">
+            <div className="surface lint-panel">
+              <div className="panel-header">
+                <div className="panel-header-main">
+                  <span className="panel-icon amber-icon">
+                    <ShieldAlert size={18} />
+                  </span>
+                  <div>
+                    <h3>Static analysis</h3>
+                    <p>Rules that run live on the editor, no database needed</p>
+                  </div>
+                </div>
+                <div className="lint-counts">
+                  {(["critical", "warning", "info"] as LintSeverity[]).map(
+                    (severity) => (
+                      <span
+                        key={severity}
+                        className={`lint-count ${severity} ${lintSummary[severity] ? "active" : ""}`}
+                      >
+                        {lintSummary[severity]} {SEVERITY_LABEL[severity]}
+                      </span>
+                    ),
+                  )}
+                </div>
+              </div>
+              <div className="lint-body">
+                {findings.length === 0 ? (
+                  <div className="lint-empty">
+                    <CheckCircle2 size={22} />
+                    <strong>Clean statement</strong>
+                    <span>
+                      No anti-patterns detected. Keep the filters selective and
+                      the result bounded as the schema grows.
+                    </span>
+                  </div>
+                ) : (
+                  findings.map((finding) => (
+                    <div
+                      className={`lint-item ${finding.severity}`}
+                      key={`${finding.rule}-${finding.line}`}
+                    >
+                      <span className="lint-severity">
+                        <AlertTriangle size={14} strokeWidth={2} />
+                        {SEVERITY_LABEL[finding.severity]}
+                      </span>
+                      <div className="lint-copy">
+                        <div className="lint-title-row">
+                          <h4>{finding.title}</h4>
+                          <span className="lint-line">line {finding.line}</span>
+                        </div>
+                        <p>{finding.detail}</p>
+                        <span className="lint-hint">
+                          <Sparkles size={12} /> {finding.hint}
+                        </span>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="surface history-panel">
+              <div className="panel-header">
+                <div className="panel-header-main">
+                  <span className="panel-icon indigo-icon">
+                    <History size={18} />
+                  </span>
+                  <div>
+                    <h3 id="history-title">Run history</h3>
+                    <p>
+                      {history.length} of {HISTORY_LIMIT} runs kept in this
+                      browser
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="history-clear"
+                  onClick={clearHistory}
+                  disabled={history.length === 0}
+                >
+                  <Trash2 size={13} /> Clear
+                </button>
+              </div>
+              {history.length === 0 ? (
+                <div className="history-empty">
+                  <Timer size={22} />
+                  <strong>No runs recorded yet</strong>
+                  <span>
+                    Every execution lands here with its latency, row count, and
+                    score — ready to reload or re-run.
+                  </span>
+                </div>
+              ) : (
+                <div className="history-body">
+                  <div className="history-stats">
+                    <span>
+                      <strong>{history[0].latency}ms</strong> last run
+                    </span>
+                    <span>
+                      <strong>
+                        {Math.round(
+                          history.reduce((total, entry) => total + entry.latency, 0) /
+                            history.length,
+                        )}
+                        ms
+                      </strong>{" "}
+                      average
+                    </span>
+                    <span>
+                      <strong>
+                        {Math.min(...history.map((entry) => entry.latency))}ms
+                      </strong>{" "}
+                      best
+                    </span>
+                  </div>
+                  <div
+                    className="latency-chart"
+                    role="img"
+                    aria-label={`Latency of the last ${history.length} runs, slowest ${maxLatency} milliseconds`}
+                  >
+                    {[...history]
+                      .reverse()
+                      .map((entry) => (
+                        <span
+                          key={`chart-${entry.id}`}
+                          className={`latency-bar ${latencyTone(entry.latency)}`}
+                          style={{
+                            height: `${Math.max(14, Math.round((entry.latency / maxLatency) * 100))}%`,
+                          }}
+                          title={`${entry.latency}ms · ${entry.summary}`}
+                        />
+                      ))}
+                  </div>
+                  <div className="history-list">
+                    {history.map((entry) => (
+                      <div className="history-row" key={entry.id}>
+                        <span
+                          className={`history-latency ${latencyTone(entry.latency)}`}
+                        >
+                          {entry.latency}
+                          <small>ms</small>
+                        </span>
+                        <div className="history-copy">
+                          <code>{entry.summary}</code>
+                          <span>
+                            {formatRunTime(entry.ranAt)} ·{" "}
+                            {entry.rows.toLocaleString()} rows · score{" "}
+                            {entry.score} · {entry.source === "manual" ? "custom SQL" : "builder"}
+                          </span>
+                        </div>
+                        <div className="history-actions">
+                          <button
+                            type="button"
+                            onClick={() => loadHistoryEntry(entry)}
+                            title="Load into the workspace"
+                            aria-label={`Load ${entry.summary} into the workspace`}
+                          >
+                            <CornerUpLeft size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => rerunHistoryEntry(entry)}
+                            title="Re-run this query"
+                            aria-label={`Re-run ${entry.summary}`}
+                            disabled={running}
+                          >
+                            <Play size={13} fill="currentColor" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
         <section
           className="surface results-panel"
           aria-labelledby="results-title"
@@ -1929,12 +2695,22 @@ export default function App() {
               </div>
               <button
                 type="button"
+                className="results-tool-button"
+                title="Download the preview as CSV"
+                aria-label="Download results as CSV"
+                onClick={exportCsv}
+              >
+                <Download size={14} />
+                <span>CSV</span>
+              </button>
+              <button
+                type="button"
                 className="icon-button"
                 title="Copy preview as JSON"
                 aria-label="Copy results as JSON"
                 onClick={() =>
                   copyText(
-                    JSON.stringify(resultRows, null, 2),
+                    JSON.stringify(sortedRows, null, 2),
                     "Result preview copied as JSON.",
                   )
                 }
@@ -1949,13 +2725,41 @@ export default function App() {
                 <thead>
                   <tr>
                     <th className="row-index-heading">#</th>
-                    {execution.columns.map((column) => (
-                      <th key={column}>{column}</th>
-                    ))}
+                    {execution.columns.map((column) => {
+                      const active = sort?.column === column;
+                      const SortIcon = active
+                        ? sort?.direction === "asc"
+                          ? ArrowUp
+                          : ArrowDown
+                        : ArrowUpDown;
+                      return (
+                        <th
+                          key={column}
+                          className={active ? "sorted" : ""}
+                          aria-sort={
+                            active
+                              ? sort?.direction === "asc"
+                                ? "ascending"
+                                : "descending"
+                              : "none"
+                          }
+                        >
+                          <button
+                            type="button"
+                            className="column-sort"
+                            onClick={() => toggleSort(column)}
+                            title={`Sort by ${column}`}
+                          >
+                            <span>{column}</span>
+                            <SortIcon size={12} />
+                          </button>
+                        </th>
+                      );
+                    })}
                   </tr>
                 </thead>
                 <tbody>
-                  {resultRows.map((row, index) => (
+                  {sortedRows.map((row, index) => (
                     <tr key={index}>
                       <td className="row-index">
                         {String(index + 1).padStart(2, "0")}
@@ -1987,14 +2791,20 @@ export default function App() {
           ) : (
             <div className="json-preview">
               <pre>
-                <Code2 size={14} /> {JSON.stringify(resultRows, null, 2)}
+                <Code2 size={14} /> {JSON.stringify(sortedRows, null, 2)}
               </pre>
             </div>
           )}
           <div className="results-footer">
             <span>
-              <span className="tiny-green-dot" /> Showing {resultRows.length} of{" "}
+              <span className="tiny-green-dot" /> Showing {sortedRows.length} of{" "}
               {execution.rows.toLocaleString()} simulated rows
+              {sort && (
+                <span className="sort-note">
+                  {" "}
+                  · sorted by {sort.column} {sort.direction}
+                </span>
+              )}
             </span>
             <span>
               Last run{" "}
@@ -2013,10 +2823,87 @@ export default function App() {
             Built for curious minds and faster queries. Execution is simulated
             locally.
           </span>
-          <span>Draft saved in this browser</span>
+          <span>
+            <kbd>⌘K</kbd> command palette · draft &amp; run history saved locally
+          </span>
         </footer>
       </main>
 
+      {paletteOpen && (
+        <div
+          className="palette-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closePalette();
+          }}
+        >
+          <div
+            className="palette"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Command palette"
+          >
+            <div className="palette-search">
+              <Search size={16} />
+              <input
+                ref={paletteInputRef}
+                value={paletteQuery}
+                onChange={(event) => {
+                  setPaletteQuery(event.target.value);
+                  setPaletteIndex(0);
+                }}
+                onKeyDown={handlePaletteKeyDown}
+                placeholder="Search commands, tables, dialects…"
+                aria-label="Search commands"
+                spellCheck={false}
+                autoComplete="off"
+              />
+              <span className="palette-esc">ESC</span>
+            </div>
+            <div className="palette-list" role="listbox" aria-label="Commands">
+              {paletteResults.map((action, index) => {
+                const Icon = action.icon;
+                return (
+                  <button
+                    key={action.id}
+                    type="button"
+                    role="option"
+                    aria-selected={index === activePaletteIndex}
+                    className={`palette-item ${index === activePaletteIndex ? "active" : ""}`}
+                    onMouseEnter={() => setPaletteIndex(index)}
+                    onClick={() => runPaletteAction(action)}
+                  >
+                    <span className="palette-icon">
+                      <Icon size={15} />
+                    </span>
+                    <span className="palette-label">
+                      {action.label}
+                      <small>{action.group}</small>
+                    </span>
+                    {action.hint && <kbd>{action.hint}</kbd>}
+                  </button>
+                );
+              })}
+              {paletteResults.length === 0 && (
+                <div className="palette-empty">
+                  No commands match “{paletteQuery.trim()}”.
+                </div>
+              )}
+            </div>
+            <div className="palette-footer">
+              <span>
+                <ArrowUp size={11} />
+                <ArrowDown size={11} /> navigate
+              </span>
+              <span>
+                <CornerDownLeft size={11} /> run
+              </span>
+              <span>
+                <Command size={11} />K toggle
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
       {drawerOpen && (
         <div
           className="drawer-backdrop"
